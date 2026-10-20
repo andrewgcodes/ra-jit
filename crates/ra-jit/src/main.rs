@@ -5878,6 +5878,14 @@ fn run_holding(
             Some(noticed) => noticed,
             None if stale => (Instant::now(), Duration::ZERO),
             None => {
+                if checkouts.inputs.pending() && checkouts.inputs.settle() {
+                    for program in &mut programs {
+                        program.unbuilt.stale = true;
+                    }
+                    lock(&as_built).clear();
+                    clients.into_iter().rev().for_each(|(_, it)| builds.waiting.push_front(it));
+                    continue;
+                }
                 for (_, (_, _, client)) in clients {
                     let _ = writeln!(&client, "ok unchanged");
                 }
@@ -6091,6 +6099,17 @@ fn run_holding(
             }
             listed.touch(&db, Some(&late));
         };
+        // The build scripts that ran again meanwhile have to have said what was loaded, or
+        // the checkout is loaded again and the requests are built after that: nothing
+        // built from what they said before is answered with.
+        if checkouts.inputs.pending() && checkouts.inputs.settle() {
+            for program in &mut programs {
+                program.unbuilt.stale = true;
+            }
+            lock(&as_built).clear();
+            clients.into_iter().rev().for_each(|(_, it)| builds.waiting.push_front(it));
+            continue;
+        }
         if std::env::var_os("RA_JIT_QUERIES").is_some() {
             let ran: Vec<String> = ide_db::executions::take(&db)
                 .iter()
