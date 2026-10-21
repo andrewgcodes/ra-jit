@@ -114,6 +114,8 @@ impl Inputs {
         let scripts = Scripts::of(workspace, config);
         self.checkouts.retain(|it| it.root != root);
         self.checkouts.push(Checkout { root: root.to_owned(), files, flags, scripts });
+        // A checkout loaded again is as its scripts say now.
+        self.verdicts.remove(root);
     }
 
     /// Whether the checkout at `root` is no longer what it was loaded from. It is asked for

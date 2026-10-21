@@ -4049,6 +4049,9 @@ struct Running {
     /// Whether a change to the source waits for the build: one that patches is short, and
     /// has nothing to patch once it is interrupted.
     kept: bool,
+    /// Whether the clients ask again instead of being answered: the build scripts said
+    /// something else than what the build reads since it began.
+    again: bool,
 }
 
 /// The builds under way and the requests that wait for them. A build reads the database on
@@ -4069,9 +4072,26 @@ struct Builds {
     /// to patch with what was compiled.
     tiered: Vec<(usize, Tiered)>,
     tier_builds: Vec<usize>,
+    /// What the files were like when each object was last built and linked.
+    as_built: Arc<std::sync::Mutex<FxHashMap<PathBuf, Settled>>>,
+    /// Whether the build scripts that ran again said something else since the turn began
+    /// and no checkout was loaded again since: nothing the turn builds is answered with.
+    turned: bool,
 }
 
 impl Builds {
+    /// The build scripts that ran again said something else than what was loaded, or failed:
+    /// nothing built meanwhile is answered with. Every program is built again once the
+    /// checkout is loaded again, which the next request has done; `clients` ask again, ahead
+    /// of the others, and so will those of the builds under way.
+    fn ask_again(&mut self, programs: &mut [Program], clients: Vec<Asked>) {
+        programs.iter_mut().for_each(|it| it.unbuilt.stale = true);
+        lock(&self.as_built).clear();
+        self.running.values_mut().for_each(|it| it.again = true);
+        clients.into_iter().rev().for_each(|it| self.waiting.push_front(it));
+        self.turned = true;
+    }
+
     /// Gives the programs that are not being built what was compiled of them at a higher
     /// level, and has each patched with it.
     fn install_tiered(&mut self, programs: &mut [Program]) {
@@ -4114,8 +4134,14 @@ impl Builds {
     }
 
     /// Queues a request, or takes back the program of a build that is over and answers its
-    /// clients. Those of a build that was interrupted ask again, ahead of the others.
-    fn take(&mut self, event: Event, programs: &mut [Program]) -> anyhow::Result<()> {
+    /// clients. Those of a build that was interrupted ask again, ahead of the others, as do
+    /// those of one whose build scripts, run again meanwhile, said something else.
+    fn take(
+        &mut self,
+        event: Event,
+        programs: &mut [Program],
+        inputs: &mut inputs::Inputs,
+    ) -> anyhow::Result<()> {
         self.stuck = false;
         let (at, program, answer) = match event {
             Event::Asked(asked) => {
@@ -4147,7 +4173,9 @@ impl Builds {
                 return Ok(());
             }
         };
-        let Some(Running { clients, .. }) = self.running.remove(&at) else { return Ok(()) };
+        let Some(Running { clients, again, .. }) = self.running.remove(&at) else {
+            return Ok(());
+        };
         programs[at] = *program;
         let program = &mut programs[at];
         let Some(answer) = answer else {
@@ -4162,6 +4190,13 @@ impl Builds {
             return Ok(());
         };
         (program.interrupted, program.moved) = (0, false);
+        // The build scripts that ran again while it was built have to have said what it
+        // read, or the checkout is loaded again and it is built after that.
+        if again || (inputs.pending() && inputs.settle()) {
+            program.unbuilt.stale = true;
+            self.ask_again(programs, clients);
+            return Ok(());
+        }
         let answer = answer?;
         for (_, _, client) in clients {
             // A client that hangs up before the answer is not the daemon's problem.
@@ -4175,11 +4210,16 @@ impl Builds {
 
     /// Leaves no build under way, for the database to be written to: a write stops every
     /// thread that reads it. The builds that are kept are waited for, the others interrupted.
-    fn settle(&mut self, db: &mut RootDatabase, programs: &mut [Program]) -> anyhow::Result<()> {
+    fn settle(
+        &mut self,
+        db: &mut RootDatabase,
+        programs: &mut [Program],
+        inputs: &mut inputs::Inputs,
+    ) -> anyhow::Result<()> {
         use ide_db::base_db::salsa::Database as _;
         while self.running.values().any(|it| it.kept) {
             let event = self.events.recv()?;
-            self.take(event, programs)?;
+            self.take(event, programs, inputs)?;
         }
         if self.running.is_empty() {
             return Ok(());
@@ -4188,7 +4228,7 @@ impl Builds {
         db.trigger_cancellation();
         while !self.running.is_empty() {
             let event = self.events.recv()?;
-            self.take(event, programs)?;
+            self.take(event, programs, inputs)?;
         }
         INTERRUPTING.store(false, Ordering::SeqCst);
         Ok(())
@@ -5295,6 +5335,8 @@ fn run_holding(
         Ok(_) => Overlay::Always,
         Err(_) => Overlay::Quick,
     };
+    // What the files were like when each object was last built and linked.
+    let as_built: Arc<std::sync::Mutex<FxHashMap<PathBuf, Settled>>> = Arc::default();
     let mut builds = Builds {
         events,
         running: FxHashMap::default(),
@@ -5304,6 +5346,8 @@ fn run_holding(
         tier_asks: Vec::new(),
         tiered: Vec::new(),
         tier_builds: Vec::new(),
+        as_built: as_built.clone(),
+        turned: false,
     };
     // How many times running each checkout that is read as a loaded one has been long to turn
     // to or from.
@@ -5319,21 +5363,20 @@ fn run_holding(
         .map_or(SLOW_SWITCH, Duration::from_millis);
     // The links under way that no build waits for, by the object each is of.
     let mut links: FxHashMap<PathBuf, std::thread::JoinHandle<()>> = FxHashMap::default();
-    // What the files were like when each object was last built and linked.
-    let as_built: Arc<std::sync::Mutex<FxHashMap<PathBuf, Settled>>> = Arc::default();
     // The checkout each loaded one is read from, when that is not itself.
     let mut viewed: FxHashMap<PathBuf, PathBuf> = FxHashMap::default();
     // The crates whose variables name another checkout than the one they were loaded in.
     let mut placed = Placed::default();
     loop {
         if WatchedFile::unwatched(&files, &db) || tree.includes_more(&db) {
-            builds.settle(&mut db, &mut programs)?;
+            builds.settle(&mut db, &mut programs, &mut checkouts.inputs)?;
         }
         if WatchedFile::watch_included(&mut files, &mut db)
             | WatchedFile::include_sources(&mut files, &mut tree, &mut db)
         {
             programs.iter_mut().for_each(|it| it.known.touch(&db, None));
         }
+        builds.turned = false;
         // The program each client asks for.
         let mut clients: Vec<(usize, Asked)> = Vec::new();
         // Where each of those programs is to be written.
@@ -5351,13 +5394,13 @@ fn run_holding(
                     && builds.tier_builds.is_empty();
                 if builds.stuck || idle {
                     let event = builds.events.recv()?;
-                    builds.take(event, &mut programs)?;
+                    builds.take(event, &mut programs, &mut checkouts.inputs)?;
                 }
                 loop {
                     // Asked again after each: a checkout that joins takes long enough for the
                     // requests sent with its own to arrive.
                     while let Ok(event) = builds.events.try_recv() {
-                        builds.take(event, &mut programs)?;
+                        builds.take(event, &mut programs, &mut checkouts.inputs)?;
                     }
                     let Some((request, target, stream)) = builds.waiting.pop_front() else {
                         break;
@@ -5386,11 +5429,13 @@ fn run_holding(
                             continue;
                         }
                         Ok(stale) => {
-                            builds.settle(&mut db, &mut programs)?;
+                            builds.settle(&mut db, &mut programs, &mut checkouts.inputs)?;
                             let start = Instant::now();
                             let before = CratesAsLoaded::of(&db);
                             let reloaded =
                                 checkouts.reload(&stale, &stream.env, &mut db, tree.vfs());
+                            // Nothing is asked for yet: what the turn builds is of this load.
+                            builds.turned = false;
                             watch_loaded(&mut db, &mut tree, &mut files);
                             let new = before.changed(&db);
                             eprintln!(
@@ -5433,7 +5478,7 @@ fn run_holding(
                             later.push((request, asked, stream));
                             continue;
                         }
-                        builds.settle(&mut db, &mut programs)?;
+                        builds.settle(&mut db, &mut programs, &mut checkouts.inputs)?;
                         let reading = process::turn(&mut db, stream.env.clone());
                         if !reading.is_empty() {
                             for program in &mut programs {
@@ -5468,8 +5513,11 @@ fn run_holding(
                             Some(View { over: base.clone(), base, project })
                         }
                     };
-                    // A checkout read as another that is as it was built takes no turn.
-                    if let (Some(view), Some(target)) = (&view, &target) {
+                    // A checkout read as another that is as it was built takes no turn, unless
+                    // its build scripts are running again: it then waits for what they say.
+                    if let (Some(view), Some(target)) = (&view, &target)
+                        && !checkouts.inputs.pending()
+                    {
                         let unchanged = links.get(&target.out).is_none_or(|it| it.is_finished())
                             && lock(&as_built)
                                 .get(&target.out)
@@ -5543,7 +5591,7 @@ fn run_holding(
                     // A checkout the daemon has not seen joins the ones it has.
                     let joined = match &target.project {
                         Some(project) if view.is_none() => {
-                            builds.settle(&mut db, &mut programs)?;
+                            builds.settle(&mut db, &mut programs, &mut checkouts.inputs)?;
                             let start = Instant::now();
                             let joined =
                                 join(project, &mut checkouts, &mut db, &mut tree, &mut files);
@@ -5738,7 +5786,7 @@ fn run_holding(
                 let start = Instant::now();
                 let differences = checkouts.differences()?;
                 if !differences.is_empty() {
-                    builds.settle(&mut db, &mut programs)?;
+                    builds.settle(&mut db, &mut programs, &mut checkouts.inputs)?;
                     checkouts.share(&mut db, tree.vfs(), differences)?;
                     watch_loaded(&mut db, &mut tree, &mut files);
                     for program in &mut programs {
@@ -5764,7 +5812,7 @@ fn run_holding(
         for (base, over) in looked {
             if *viewed.get(&base).unwrap_or(&base) != over {
                 eprintln!("view: {} as {}", over.display(), base.display());
-                builds.settle(&mut db, &mut programs)?;
+                builds.settle(&mut db, &mut programs, &mut checkouts.inputs)?;
                 turned.extend(viewed.get(&base).map(|it| (base.clone(), it.clone())));
                 turned.extend((base != over).then(|| (base.clone(), over.clone())));
                 db.set_view(&base, &over, built_in(&db, &base));
@@ -5809,7 +5857,7 @@ fn run_holding(
         }
         loop {
             if tree.relisted(&db) {
-                builds.settle(&mut db, &mut programs)?;
+                builds.settle(&mut db, &mut programs, &mut checkouts.inputs)?;
             }
             // A new file has no timestamp yet, so the pass below takes it for a changed one.
             for (file, path) in tree.added(&mut db).added {
@@ -5878,12 +5926,10 @@ fn run_holding(
             Some(noticed) => noticed,
             None if stale => (Instant::now(), Duration::ZERO),
             None => {
-                if checkouts.inputs.pending() && checkouts.inputs.settle() {
-                    for program in &mut programs {
-                        program.unbuilt.stale = true;
-                    }
-                    lock(&as_built).clear();
-                    clients.into_iter().rev().for_each(|(_, it)| builds.waiting.push_front(it));
+                // The build scripts that ran again have to have said what was loaded for
+                // nothing to have changed.
+                if builds.turned || (checkouts.inputs.pending() && checkouts.inputs.settle()) {
+                    builds.ask_again(&mut programs, clients.into_iter().map(|it| it.1).collect());
                     continue;
                 }
                 for (_, (_, _, client)) in clients {
@@ -5893,7 +5939,7 @@ fn run_holding(
             }
         };
         if touched.len() + gone.len() != 0 {
-            builds.settle(&mut db, &mut programs)?;
+            builds.settle(&mut db, &mut programs, &mut checkouts.inputs)?;
         }
         let settled = noticed.elapsed();
         let read = Instant::now();
@@ -6001,6 +6047,16 @@ fn run_holding(
             );
         }
         if background {
+            // A program that is as it was is answered for now, once the build scripts that
+            // ran again have said what was loaded; the builds settle them when they are over.
+            if builds.turned
+                || (clients.iter().any(|(at, _)| !programs[*at].unbuilt.stale)
+                    && checkouts.inputs.pending()
+                    && checkouts.inputs.settle())
+            {
+                builds.ask_again(&mut programs, clients.into_iter().map(|it| it.1).collect());
+                continue;
+            }
             let mut asked: FxHashMap<usize, Vec<Asked>> = FxHashMap::default();
             for (at, client) in clients {
                 asked.entry(at).or_default().push(client);
@@ -6031,7 +6087,7 @@ fn run_holding(
                     tests: None,
                 };
                 let mut program = Box::new(std::mem::replace(program, away));
-                builds.running.insert(at, Running { clients, kept });
+                builds.running.insert(at, Running { clients, kept, again: false });
                 let (db, listed, paths, sender) =
                     (db.clone(), listed.clone(), paths.clone(), sender.clone());
                 let wanted = outputs.remove(&at);
@@ -6102,12 +6158,8 @@ fn run_holding(
         // The build scripts that ran again meanwhile have to have said what was loaded, or
         // the checkout is loaded again and the requests are built after that: nothing
         // built from what they said before is answered with.
-        if checkouts.inputs.pending() && checkouts.inputs.settle() {
-            for program in &mut programs {
-                program.unbuilt.stale = true;
-            }
-            lock(&as_built).clear();
-            clients.into_iter().rev().for_each(|(_, it)| builds.waiting.push_front(it));
+        if builds.turned || (checkouts.inputs.pending() && checkouts.inputs.settle()) {
+            builds.ask_again(&mut programs, clients.into_iter().map(|it| it.1).collect());
             continue;
         }
         if std::env::var_os("RA_JIT_QUERIES").is_some() {
