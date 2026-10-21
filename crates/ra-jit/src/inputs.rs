@@ -6,6 +6,7 @@
 use std::{
     hash::{Hash as _, Hasher as _},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use ide_db::base_db::{Env, TargetKind};
@@ -19,6 +20,20 @@ const FLAGS: &[&str] = &["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RU
 #[derive(Default)]
 pub(crate) struct Inputs {
     checkouts: Vec<Checkout>,
+    /// The build scripts that run again, on threads of their own, while the build goes on
+    /// without them: cargo takes tens of milliseconds to run one, and what it says is
+    /// almost always what was loaded. Settled before any client is answered.
+    pending: Vec<Pending>,
+    /// What a run that did not say the same found, for the checkout's next look: that it
+    /// is stale, or why its scripts can't say.
+    verdicts: FxHashMap<PathBuf, anyhow::Result<bool>>,
+}
+
+/// The build scripts of one checkout running again, for `finish` to take.
+struct Pending {
+    root: PathBuf,
+    config: CargoConfig,
+    run: std::thread::JoinHandle<anyhow::Result<project_model::WorkspaceBuildScripts>>,
 }
 
 /// What the workspace at `root` was loaded from.
@@ -54,7 +69,7 @@ impl Watched {
 
 /// The build scripts of one workspace and what they said.
 struct Scripts {
-    workspace: ProjectWorkspace,
+    workspace: Arc<ProjectWorkspace>,
     config: CargoConfig,
     /// What cargo runs a script again for a change of.
     files: Vec<Watched>,
@@ -99,12 +114,21 @@ impl Inputs {
         let scripts = Scripts::of(workspace, config);
         self.checkouts.retain(|it| it.root != root);
         self.checkouts.push(Checkout { root: root.to_owned(), files, flags, scripts });
+        // A checkout loaded again is as its scripts say now.
+        self.verdicts.remove(root);
     }
 
     /// Whether the checkout at `root` is no longer what it was loaded from. It is asked for
     /// a process with the variables `env`, or with `None` for whoever it was loaded for.
     /// An error is why its build scripts can't say.
     pub(crate) fn stale(&mut self, root: &Path, env: Option<&Env>) -> anyhow::Result<bool> {
+        if let Some(verdict) = self.verdicts.remove(root) {
+            return verdict;
+        }
+        // Its scripts are running: they are settled before the build is answered for.
+        if self.pending.iter().any(|it| it.root == root) {
+            return Ok(false);
+        }
         let Some(checkout) = self.checkouts.iter_mut().find(|it| it.root == root) else {
             return Ok(false);
         };
@@ -116,10 +140,39 @@ impl Inputs {
         {
             return Ok(true);
         }
-        match &mut checkout.scripts {
-            Some(scripts) => scripts.changed(env),
-            None => Ok(false),
+        let started = checkout.scripts.as_ref().and_then(|scripts| scripts.start(env));
+        if let Some((config, run)) = started {
+            self.pending.push(Pending { root: root.to_owned(), config, run });
         }
+        Ok(false)
+    }
+
+    /// Whether build scripts are running again for a checkout.
+    pub(crate) fn pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Waits for the build scripts that run again and takes what they said: whether any
+    /// checkout turned out stale, or its scripts failed. What those found is the answer to
+    /// the next `stale` for the checkout, which has it loaded again or the client told.
+    pub(crate) fn settle(&mut self) -> bool {
+        let mut turned = false;
+        for Pending { root, config, run } in std::mem::take(&mut self.pending) {
+            let said = match run.join() {
+                Ok(said) => said,
+                Err(_) => Err(anyhow::anyhow!("the build scripts could not be run again")),
+            };
+            let scripts = self.checkouts.iter_mut().find(|it| it.root == root);
+            let verdict = match scripts.and_then(|it| it.scripts.as_mut()) {
+                Some(scripts) => said.and_then(|said| scripts.finish(config, said)),
+                None => Ok(false),
+            };
+            if !matches!(verdict, Ok(false)) {
+                turned = true;
+                self.verdicts.insert(root, verdict);
+            }
+        }
+        turned
     }
 
     /// The variables cargo and the build scripts of the checkout at `root` read, as a
@@ -164,28 +217,52 @@ impl Scripts {
         if files.is_empty() && variables.is_empty() {
             return None;
         }
-        Some(Scripts { workspace: workspace.clone(), config: config.clone(), files, variables })
+        Some(Scripts {
+            workspace: Arc::new(workspace.clone()),
+            config: config.clone(),
+            files,
+            variables,
+        })
     }
 
-    /// Runs the scripts again where cargo would for a process with `env`, or with `None`
-    /// for one with the variables they last ran with: whether what they say is no longer
-    /// what was loaded.
-    fn changed(&mut self, env: Option<&Env>) -> anyhow::Result<bool> {
+    /// Starts the scripts again where cargo would for a process with `env`, or with `None`
+    /// for one with the variables they last ran with, on a thread of its own: `finish`
+    /// takes what they say. `None` when nothing they are run again for changed.
+    fn start(
+        &self,
+        env: Option<&Env>,
+    ) -> Option<(
+        CargoConfig,
+        std::thread::JoinHandle<anyhow::Result<project_model::WorkspaceBuildScripts>>,
+    )> {
         let files = self.files.iter().any(Watched::changed);
         let variables =
             env.is_some_and(|env| self.variables.iter().any(|(name, was)| env.get(name) != *was));
         if !files && !variables {
-            return Ok(false);
+            return None;
         }
-        let ProjectWorkspaceKind::Cargo { build_scripts: loaded, .. } = &self.workspace.kind else {
-            return Ok(false);
-        };
         let mut config = self.config.clone();
         for (name, was) in &self.variables {
             let value = env.map_or_else(|| was.clone(), |env| env.get(name));
             config.extra_env.insert(name.clone(), value);
         }
-        let said = self.workspace.run_build_scripts(&config, &|_| {})?;
+        let workspace = self.workspace.clone();
+        let run = {
+            let config = config.clone();
+            std::thread::spawn(move || workspace.run_build_scripts(&config, &|_| {}))
+        };
+        Some((config, run))
+    }
+
+    /// Takes what the scripts `start` ran said: whether it is no longer what was loaded.
+    fn finish(
+        &mut self,
+        config: CargoConfig,
+        said: project_model::WorkspaceBuildScripts,
+    ) -> anyhow::Result<bool> {
+        let ProjectWorkspaceKind::Cargo { build_scripts: loaded, .. } = &self.workspace.kind else {
+            return Ok(false);
+        };
         if let Some(error) = said.error() {
             anyhow::bail!("a build script failed: {}", error.trim().replace('\n', " "));
         }

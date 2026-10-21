@@ -55,6 +55,12 @@ All notable changes to ra-jit are written here. The format follows
 
 ### Changed
 
+- The daemon runs a checkout's build scripts again on a thread while the build goes on,
+  instead of before it, when cargo would run them (a file or variable they said they read
+  changed, or any file of a package whose script said nothing). The answer waits for what
+  they say: when it is not what was loaded, or a script fails, the checkout is loaded again
+  and the requests are built after that, as before. A function-body edit of hyperfine builds
+  in 117-130 ms instead of 133-169 ms (8 vCPU Linux, medians of 10).
 - `vendor/rust-analyzer` and `vendor/rustc_abi` are git subtrees instead of submodules: a
   plain `git clone` builds, and the flake builds from its own tree with no second pin of the
   forks.
